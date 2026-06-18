@@ -1,0 +1,815 @@
+[1mdiff --git a/include/linux/migrate.h b/include/linux/migrate.h[m
+[1mindex c8077e936691..47393797f67c 100644[m
+[1m--- a/include/linux/migrate.h[m
+[1m+++ b/include/linux/migrate.h[m
+[36m@@ -49,6 +49,14 @@[m [mextern int migrate_pages(struct list_head *l, new_page_t new, free_page_t free,[m
+ 		unsigned long private, enum migrate_mode mode, int reason,[m
+ 		unsigned int *ret_succeeded);[m
+ extern struct page *alloc_migration_target(struct page *page, unsigned long private);[m
+[32m+[m
+[32m+[m[32m/* UTS: bulk migrate file-backed pages to a target NUMA node. */[m
+[32m+[m[32mextern int uts_migrate_file_pages_to_node_bulk(struct page **src_pages,[m
+[32m+[m					[32m       struct page **dst_pages,[m
+[32m+[m					[32m       u8 *status,[m
+[32m+[m					[32m       int nr_pages,[m
+[32m+[m					[32m       int target_nid);[m
+[32m+[m
+ extern int isolate_movable_page(struct page *page, isolate_mode_t mode);[m
+ [m
+ extern void migrate_page_states(struct page *newpage, struct page *page);[m
+[36m@@ -67,6 +75,14 @@[m [mstatic inline int migrate_pages(struct list_head *l, new_page_t new,[m
+ static inline struct page *alloc_migration_target(struct page *page,[m
+ 		unsigned long private)[m
+ 	{ return NULL; }[m
+[32m+[m[32mstatic inline int uts_migrate_file_pages_to_node_bulk(struct page **src_pages,[m
+[32m+[m						[32m      struct page **dst_pages,[m
+[32m+[m						[32m      u8 *status,[m
+[32m+[m						[32m      int nr_pages,[m
+[32m+[m						[32m      int target_nid)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn -ENOSYS;[m
+[32m+[m[32m}[m
+ static inline int isolate_movable_page(struct page *page, isolate_mode_t mode)[m
+ 	{ return -EBUSY; }[m
+ [m
+[1mdiff --git a/include/linux/page_ext.h b/include/linux/page_ext.h[m
+[1mindex fabb2e1e087f..789acc743f5f 100644[m
+[1m--- a/include/linux/page_ext.h[m
+[1m+++ b/include/linux/page_ext.h[m
+[36m@@ -5,8 +5,10 @@[m
+ #include <linux/types.h>[m
+ #include <linux/stacktrace.h>[m
+ #include <linux/stackdepot.h>[m
+[32m+[m[32m#include <linux/list.h>[m
+ [m
+ struct pglist_data;[m
+[32m+[m
+ struct page_ext_operations {[m
+ 	size_t offset;[m
+ 	size_t size;[m
+[36m@@ -34,6 +36,23 @@[m [menum page_ext_flags {[m
+  */[m
+ struct page_ext {[m
+ 	unsigned long flags;[m
+[32m+[m
+[32m+[m	[32m/* UTS: CXL hotness / promotion tracking */[m
+[32m+[m	[32mu64 uts_cxl_slot_id;[m
+[32m+[m	[32mu8  uts_in_cxl_promote_list;[m
+[32m+[m	[32mu8  uts_in_dram_demote_list;[m
+[32m+[m
+[32m+[m	[32m/* UTS: DRAM aging / demotion tracking */[m
+[32m+[m	[32mu8  uts_dram_track_state;[m
+[32m+[m	[32mstruct list_head uts_dram_track_link;[m
+[32m+[m	[32munsigned long uts_dram_tracked_pfn;[m
+[32m+[m	[32mu64 uts_dram_slot_id;[m
+[32m+[m
+[32m+[m	[32m/* UTS: promotion/demotion sampling */[m
+[32m+[m	[32mu8 uts_promote_sampled;[m
+[32m+[m	[32mu8 uts_promote_sample_hit_hot;[m
+[32m+[m	[32mu8 uts_demote_sampled;[m
+[32m+[m	[32mu8 uts_demote_sample_hit_promote;[m
+ };[m
+ [m
+ extern unsigned long page_ext_size;[m
+[36m@@ -43,13 +62,16 @@[m [mextern void pgdat_page_ext_init(struct pglist_data *pgdat);[m
+ static inline void page_ext_init_flatmem(void)[m
+ {[m
+ }[m
+[32m+[m
+ extern void page_ext_init(void);[m
+[32m+[m
+ static inline void page_ext_init_flatmem_late(void)[m
+ {[m
+ }[m
+ #else[m
+ extern void page_ext_init_flatmem(void);[m
+ extern void page_ext_init_flatmem_late(void);[m
+[32m+[m
+ static inline void page_ext_init(void)[m
+ {[m
+ }[m
+[36m@@ -60,11 +82,13 @@[m [mstruct page_ext *lookup_page_ext(const struct page *page);[m
+ static inline struct page_ext *page_ext_next(struct page_ext *curr)[m
+ {[m
+ 	void *next = curr;[m
+[32m+[m
+ 	next += page_ext_size;[m
+ 	return next;[m
+ }[m
+ [m
+ #else /* !CONFIG_PAGE_EXTENSION */[m
+[32m+[m
+ struct page_ext;[m
+ [m
+ static inline void pgdat_page_ext_init(struct pglist_data *pgdat)[m
+[36m@@ -87,5 +111,373 @@[m [mstatic inline void page_ext_init_flatmem_late(void)[m
+ static inline void page_ext_init_flatmem(void)[m
+ {[m
+ }[m
+[32m+[m
+ #endif /* CONFIG_PAGE_EXTENSION */[m
+[31m-#endif /* __LINUX_PAGE_EXT_H */[m
+[32m+[m
+[32m+[m[32m/* =========================[m
+[32m+[m[32m * UTS page_ext helpers[m
+[32m+[m[32m * ========================= */[m
+[32m+[m
+[32m+[m[32m#define UTS_DRAM_NONE              0[m
+[32m+[m[32m#define UTS_DRAM_TRACKED           1[m
+[32m+[m[32m#define UTS_DRAM_DEMOTE_CANDIDATE  2[m
+[32m+[m
+[32m+[m[32m#ifdef CONFIG_PAGE_EXTENSION[m
+[32m+[m
+[32m+[m[32mstatic __always_inline u64 uts_page_cxl_slot_id_read(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn 0;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_cxl_slot_id);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_cxl_slot_id_write(struct page *page, u64 v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_cxl_slot_id, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_in_cxl_promote_list(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn false;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_in_cxl_promote_list);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_in_cxl_promote_list(struct page *page,[m
+[32m+[m							[32m     bool v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_in_cxl_promote_list, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_in_dram_demote_list(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn false;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_in_dram_demote_list);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_in_dram_demote_list(struct page *page,[m
+[32m+[m							[32m    bool v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_in_dram_demote_list, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline u8 uts_page_dram_track_state_read(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn UTS_DRAM_NONE;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_dram_track_state);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_dram_track_state_write(struct page *page,[m
+[32m+[m							[32m    u8 v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_dram_track_state, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline struct list_head *uts_page_dram_track_link(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn NULL;[m
+[32m+[m
+[32m+[m	[32mreturn &pe->uts_dram_track_link;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline unsigned long uts_page_dram_tracked_pfn_read(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn 0;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_dram_tracked_pfn);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_dram_tracked_pfn_write(struct page *page,[m
+[32m+[m							[32m    unsigned long pfn)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_dram_tracked_pfn, pfn);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline u64 uts_page_dram_slot_id_read(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn 0;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_dram_slot_id);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_dram_slot_id_write(struct page *page, u64 v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_dram_slot_id, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_dram_tracked(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn uts_page_dram_track_state_read(page) != UTS_DRAM_NONE;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/*[m
+[32m+[m[32m * Caller must hold the same lock that protects the DRAM tracking lists.[m
+[32m+[m[32m */[m
+[32m+[m[32mstatic __always_inline void uts_page_dram_unlink_if_tracked(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mif (READ_ONCE(pe->uts_dram_track_state) == UTS_DRAM_NONE)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mlist_del_init(&pe->uts_dram_track_link);[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_dram_track_state, UTS_DRAM_NONE);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_promote_sampled(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn false;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_promote_sampled);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_promote_sampled(struct page *page,[m
+[32m+[m							[32m bool v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_promote_sampled, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_promote_sample_hit_hot(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn false;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_promote_sample_hit_hot);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_promote_sample_hit_hot(struct page *page,[m
+[32m+[m								[32mbool v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_promote_sample_hit_hot, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_demote_sampled(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn false;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_demote_sampled);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_demote_sampled(struct page *page,[m
+[32m+[m							[32mbool v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_demote_sampled, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_demote_sample_hit_promote(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn false;[m
+[32m+[m
+[32m+[m	[32mreturn READ_ONCE(pe->uts_demote_sample_hit_promote);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_demote_sample_hit_promote(struct page *page,[m
+[32m+[m								[32m   bool v)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct page_ext *pe = lookup_page_ext(page);[m
+[32m+[m
+[32m+[m	[32mif (!pe)[m
+[32m+[m		[32mreturn;[m
+[32m+[m
+[32m+[m	[32mWRITE_ONCE(pe->uts_demote_sample_hit_promote, v);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m#else /* !CONFIG_PAGE_EXTENSION */[m
+[32m+[m
+[32m+[m[32mstatic __always_inline u64 uts_page_cxl_slot_id_read(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn 0;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_cxl_slot_id_write(struct page *page, u64 v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_in_cxl_promote_list(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn false;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_in_cxl_promote_list(struct page *page,[m
+[32m+[m							[32m     bool v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_in_dram_demote_list(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn false;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_in_dram_demote_list(struct page *page,[m
+[32m+[m							[32m    bool v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline u8 uts_page_dram_track_state_read(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn UTS_DRAM_NONE;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_dram_track_state_write(struct page *page,[m
+[32m+[m							[32m    u8 v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline struct list_head *uts_page_dram_track_link(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn NULL;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline unsigned long uts_page_dram_tracked_pfn_read(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn 0;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_dram_tracked_pfn_write(struct page *page,[m
+[32m+[m							[32m    unsigned long pfn)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline u64 uts_page_dram_slot_id_read(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn 0;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_dram_slot_id_write(struct page *page, u64 v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_dram_tracked(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn false;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_dram_unlink_if_tracked(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_promote_sampled(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn false;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_promote_sampled(struct page *page,[m
+[32m+[m							[32m bool v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_promote_sample_hit_hot(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn false;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_promote_sample_hit_hot(struct page *page,[m
+[32m+[m								[32mbool v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_demote_sampled(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn false;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_demote_sampled(struct page *page,[m
+[32m+[m							[32mbool v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline bool uts_page_demote_sample_hit_promote(struct page *page)[m
+[32m+[m[32m{[m
+[32m+[m	[32mreturn false;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mstatic __always_inline void uts_page_set_demote_sample_hit_promote(struct page *page,[m
+[32m+[m								[32m   bool v)[m
+[32m+[m[32m{[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m#endif /* CONFIG_PAGE_EXTENSION */[m
+[32m+[m
+[32m+[m[32m#endif /* __LINUX_PAGE_EXT_H */[m
+\ No newline at end of file[m
+[1mdiff --git a/mm/migrate.c b/mm/migrate.c[m
+[1mindex 728fbb0b9024..b3efba3a841b 100644[m
+[1m--- a/mm/migrate.c[m
+[1m+++ b/mm/migrate.c[m
+[36m@@ -134,7 +134,7 @@[m [mstatic void putback_movable_page(struct page *page)[m
+  *[m
+  * This function shall be used whenever the isolated pageset has been[m
+  * built from lru, balloon, hugetlbfs page. See isolate_migratepages_range()[m
+[31m- * and isolate_hugetlb().[m
+[32m+[m[32m * and isolate_huge_page().[m
+  */[m
+ void putback_movable_pages(struct list_head *l)[m
+ {[m
+[36m@@ -424,12 +424,8 @@[m [mint migrate_page_move_mapping(struct address_space *mapping,[m
+ 	if (PageSwapBacked(page)) {[m
+ 		__SetPageSwapBacked(newpage);[m
+ 		if (PageSwapCache(page)) {[m
+[31m-			int i;[m
+[31m-[m
+ 			SetPageSwapCache(newpage);[m
+[31m-			for (i = 0; i < (1 << compound_order(page)); i++)[m
+[31m-				set_page_private(newpage + i,[m
+[31m-						 page_private(page + i));[m
+[32m+[m			[32mset_page_private(newpage, page_private(page));[m
+ 		}[m
+ 	} else {[m
+ 		VM_BUG_ON_PAGE(PageSwapCache(page), page);[m
+[36m@@ -952,12 +948,9 @@[m [mstatic int move_to_new_page(struct page *newpage, struct page *page,[m
+ 		if (!PageMappingFlags(page))[m
+ 			page->mapping = NULL;[m
+ [m
+[31m-		if (likely(!is_zone_device_page(newpage))) {[m
+[31m-			int i, nr = compound_nr(newpage);[m
+[32m+[m		[32mif (likely(!is_zone_device_page(newpage)))[m
+[32m+[m			[32mflush_dcache_page(newpage);[m
+ [m
+[31m-			for (i = 0; i < nr; i++)[m
+[31m-				flush_dcache_page(newpage + i);[m
+[31m-		}[m
+ 	}[m
+ out:[m
+ 	return rc;[m
+[36m@@ -1291,7 +1284,6 @@[m [mstatic int unmap_and_move_huge_page(new_page_t get_new_page,[m
+ 	struct page *new_hpage;[m
+ 	struct anon_vma *anon_vma = NULL;[m
+ 	struct address_space *mapping = NULL;[m
+[31m-	enum ttu_flags ttu = 0;[m
+ [m
+ 	/*[m
+ 	 * Migratability of hugepages depends on architectures and their size.[m
+[36m@@ -1345,6 +1337,9 @@[m [mstatic int unmap_and_move_huge_page(new_page_t get_new_page,[m
+ 		goto put_anon;[m
+ [m
+ 	if (page_mapped(hpage)) {[m
+[32m+[m		[32mbool mapping_locked = false;[m
+[32m+[m		[32menum ttu_flags ttu = 0;[m
+[32m+[m
+ 		if (!PageAnon(hpage)) {[m
+ 			/*[m
+ 			 * In shared mappings, try_to_unmap could potentially[m
+[36m@@ -1356,11 +1351,15 @@[m [mstatic int unmap_and_move_huge_page(new_page_t get_new_page,[m
+ 			if (unlikely(!mapping))[m
+ 				goto unlock_put_anon;[m
+ [m
+[32m+[m			[32mmapping_locked = true;[m
+ 			ttu |= TTU_RMAP_LOCKED;[m
+ 		}[m
+ [m
+ 		try_to_migrate(hpage, ttu);[m
+ 		page_was_mapped = 1;[m
+[32m+[m
+[32m+[m		[32mif (mapping_locked)[m
+[32m+[m			[32mi_mmap_unlock_write(mapping);[m
+ 	}[m
+ [m
+ 	if (!page_mapped(hpage))[m
+[36m@@ -1368,11 +1367,7 @@[m [mstatic int unmap_and_move_huge_page(new_page_t get_new_page,[m
+ [m
+ 	if (page_was_mapped)[m
+ 		remove_migration_ptes(hpage,[m
+[31m-			rc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage,[m
+[31m-				ttu ? true : false);[m
+[31m-[m
+[31m-	if (ttu & TTU_RMAP_LOCKED)[m
+[31m-		i_mmap_unlock_write(mapping);[m
+[32m+[m			[32mrc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage, false);[m
+ [m
+ unlock_put_anon:[m
+ 	unlock_page(new_hpage);[m
+[36m@@ -1650,6 +1645,142 @@[m [mstruct page *alloc_migration_target(struct page *page, unsigned long private)[m
+ 	return new_page;[m
+ }[m
+ [m
+[32m+[m[32m/* =========================[m
+[32m+[m[32m * UTS bulk file-page migration helper[m
+[32m+[m[32m * ========================= */[m
+[32m+[m
+[32m+[m[32mstruct uts_bulk_migrate_page {[m
+[32m+[m	[32mstruct list_head lru;[m
+[32m+[m	[32mstruct page *page;[m
+[32m+[m	[32mint index;[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mstruct uts_bulk_migrate_target {[m
+[32m+[m	[32mint target_nid;[m
+[32m+[m	[32mstruct page **dst_pages;[m
+[32m+[m	[32mu8 *status;[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mstatic struct page *uts_alloc_migration_target(struct page *page,[m
+[32m+[m					[32m       unsigned long private)[m
+[32m+[m[32m{[m
+[32m+[m	[32mstruct uts_bulk_migrate_target *target;[m
+[32m+[m	[32mstruct uts_bulk_migrate_page *entry;[m
+[32m+[m	[32mstruct migration_target_control mtc;[m
+[32m+[m	[32mstruct page *newpage;[m
+[32m+[m
+[32m+[m	[32mtarget = (struct uts_bulk_migrate_target *)private;[m
+[32m+[m	[32mentry = container_of(page->lru.prev, struct uts_bulk_migrate_page, lru);[m
+[32m+[m
+[32m+[m	[32mmtc.nid = target->target_nid;[m
+[32m+[m	[32mmtc.nmask = NULL;[m
+[32m+[m	[32mmtc.gfp_mask = GFP_HIGHUSER_MOVABLE | __GFP_THISNODE;[m
+[32m+[m
+[32m+[m	[32mnewpage = alloc_migration_target(page, (unsigned long)&mtc);[m
+[32m+[m	[32mif (!newpage)[m
+[32m+[m		[32mreturn NULL;[m
+[32m+[m
+[32m+[m	[32mtarget->dst_pages[entry->index] = newpage;[m
+[32m+[m	[32mtarget->status[entry->index] = 1;[m
+[32m+[m
+[32m+[m	[32mreturn newpage;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/*[m
+[32m+[m[32m * UTS: migrate an array of file-backed base pages to target_nid.[m
+[32m+[m[32m *[m
+[32m+[m[32m * Return:[m
+[32m+[m[32m *   >= 0: number of pages that failed to migrate[m
+[32m+[m[32m *   < 0:  errno[m
+[32m+[m[32m *[m
+[32m+[m[32m * status[i]:[m
+[32m+[m[32m *   1 = migrated / destination page allocated[m
+[32m+[m[32m *   0 = failed or skipped[m
+[32m+[m[32m *[m
+[32m+[m[32m * dst_pages[i]:[m
+[32m+[m[32m *   destination page for successful migration, NULL otherwise[m
+[32m+[m[32m */[m
+[32m+[m[32mint uts_migrate_file_pages_to_node_bulk(struct page **src_pages,[m
+[32m+[m					[32mstruct page **dst_pages,[m
+[32m+[m					[32mu8 *status,[m
+[32m+[m					[32mint nr_pages,[m
+[32m+[m					[32mint target_nid)[m
+[32m+[m[32m{[m
+[32m+[m	[32mLIST_HEAD(migrate_list);[m
+[32m+[m	[32mstruct uts_bulk_migrate_page *entries;[m
+[32m+[m	[32mstruct uts_bulk_migrate_target target;[m
+[32m+[m	[32munsigned int nr_succeeded = 0;[m
+[32m+[m	[32mint i, ret;[m
+[32m+[m
+[32m+[m	[32mif (!src_pages || !dst_pages || !status || nr_pages <= 0)[m
+[32m+[m		[32mreturn -EINVAL;[m
+[32m+[m
+[32m+[m	[32mentries = kcalloc(nr_pages, sizeof(*entries), GFP_KERNEL);[m
+[32m+[m	[32mif (!entries)[m
+[32m+[m		[32mreturn -ENOMEM;[m
+[32m+[m
+[32m+[m	[32mfor (i = 0; i < nr_pages; i++) {[m
+[32m+[m		[32mstruct page *page = src_pages[i];[m
+[32m+[m
+[32m+[m		[32mdst_pages[i] = NULL;[m
+[32m+[m		[32mstatus[i] = 0;[m
+[32m+[m
+[32m+[m		[32mif (!page)[m
+[32m+[m			[32mcontinue;[m
+[32m+[m
+[32m+[m		[32m/* UTS helper is intentionally for file-backed base pages. */[m
+[32m+[m		[32mif (PageAnon(page))[m
+[32m+[m			[32mcontinue;[m
+[32m+[m		[32mif (PageHuge(page) || PageTransHuge(page) || PageCompound(page))[m
+[32m+[m			[32mcontinue;[m
+[32m+[m		[32mif (!page_mapping(page) || !page_mapping(page)->host)[m
+[32m+[m			[32mcontinue;[m
+[32m+[m		[32mif (page_to_nid(page) == target_nid)[m
+[32m+[m			[32mcontinue;[m
+[32m+[m
+[32m+[m		[32mif (isolate_lru_page(page))[m
+[32m+[m			[32mcontinue;[m
+[32m+[m
+[32m+[m		[32mentries[i].page = page;[m
+[32m+[m		[32mentries[i].index = i;[m
+[32m+[m
+[32m+[m		[32m/*[m
+[32m+[m		[32m * migrate_pages() expects page->lru to be linked directly.[m
+[32m+[m		[32m * Keep entry metadata in a parallel array; the page itself[m
+[32m+[m		[32m * is what goes onto migrate_list.[m
+[32m+[m		[32m */[m
+[32m+[m		[32mlist_add_tail(&page->lru, &migrate_list);[m
+[32m+[m
+[32m+[m		[32mmod_node_page_state(page_pgdat(page),[m
+[32m+[m				[32m    NR_ISOLATED_ANON + page_is_file_lru(page),[m
+[32m+[m				[32m    thp_nr_pages(page));[m
+[32m+[m	[32m}[m
+[32m+[m
+[32m+[m	[32mif (list_empty(&migrate_list)) {[m
+[32m+[m		[32mkfree(entries);[m
+[32m+[m		[32mreturn 0;[m
+[32m+[m	[32m}[m
+[32m+[m
+[32m+[m	[32mtarget.target_nid = target_nid;[m
+[32m+[m	[32mtarget.dst_pages = dst_pages;[m
+[32m+[m	[32mtarget.status = status;[m
+[32m+[m
+[32m+[m	[32mret = migrate_pages(&migrate_list,[m
+[32m+[m			[32m    uts_alloc_migration_target,[m
+[32m+[m			[32m    NULL,[m
+[32m+[m			[32m    (unsigned long)&target,[m
+[32m+[m			[32m    MIGRATE_SYNC,[m
+[32m+[m			[32m    MR_DEMOTION,[m
+[32m+[m			[32m    &nr_succeeded);[m
+[32m+[m
+[32m+[m	[32mif (ret)[m
+[32m+[m		[32mputback_movable_pages(&migrate_list);[m
+[32m+[m
+[32m+[m	[32mkfree(entries);[m
+[32m+[m	[32mreturn ret;[m
+[32m+[m[32m}[m
+[32m+[m[32mEXPORT_SYMBOL_GPL(uts_migrate_file_pages_to_node_bulk);[m
+[32m+[m
+ #ifdef CONFIG_NUMA[m
+ [m
+ static int store_status(int __user *status, int start, int value, int nr)[m
+[36m@@ -1724,9 +1855,8 @@[m [mstatic int add_page_for_migration(struct mm_struct *mm, unsigned long addr,[m
+ [m
+ 	if (PageHuge(page)) {[m
+ 		if (PageHead(page)) {[m
+[31m-			err = isolate_hugetlb(page, pagelist);[m
+[31m-			if (!err)[m
+[31m-				err = 1;[m
+[32m+[m			[32misolate_huge_page(page, pagelist);[m
+[32m+[m			[32merr = 1;[m
+ 		}[m
+ 	} else {[m
+ 		struct page *head;[m
+[36m@@ -1790,7 +1920,6 @@[m [mstatic int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,[m
+ 			 const int __user *nodes,[m
+ 			 int __user *status, int flags)[m
+ {[m
+[31m-	compat_uptr_t __user *compat_pages = (void __user *)pages;[m
+ 	int current_node = NUMA_NO_NODE;[m
+ 	LIST_HEAD(pagelist);[m
+ 	int start, i;[m
+[36m@@ -1804,17 +1933,8 @@[m [mstatic int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,[m
+ 		int node;[m
+ [m
+ 		err = -EFAULT;[m
+[31m-		if (in_compat_syscall()) {[m
+[31m-			compat_uptr_t cp;[m
+[31m-[m
+[31m-			if (get_user(cp, compat_pages + i))[m
+[31m-				goto out_flush;[m
+[31m-[m
+[31m-			p = compat_ptr(cp);[m
+[31m-		} else {[m
+[31m-			if (get_user(p, pages + i))[m
+[31m-				goto out_flush;[m
+[31m-		}[m
+[32m+[m		[32mif (get_user(p, pages + i))[m
+[32m+[m			[32mgoto out_flush;[m
+ 		if (get_user(node, nodes + i))[m
+ 			goto out_flush;[m
+ 		addr = (unsigned long)untagged_addr(p);[m
+[36m@@ -2435,14 +2555,13 @@[m [mstatic int migrate_vma_collect_pmd(pmd_t *pmdp,[m
+ 		migrate->dst[migrate->npages] = 0;[m
+ 		migrate->src[migrate->npages++] = mpfn;[m
+ 	}[m
+[32m+[m	[32march_leave_lazy_mmu_mode();[m
+[32m+[m	[32mpte_unmap_unlock(ptep - 1, ptl);[m
+ [m
+ 	/* Only flush the TLB if we actually modified any entries */[m
+ 	if (unmapped)[m
+ 		flush_tlb_range(walk->vma, start, end);[m
+ [m
+[31m-	arch_leave_lazy_mmu_mode();[m
+[31m-	pte_unmap_unlock(ptep - 1, ptl);[m
+[31m-[m
+ 	return 0;[m
+ }[m
+ [m
+[36m@@ -3063,16 +3182,20 @@[m [mvoid migrate_vma_finalize(struct migrate_vma *migrate)[m
+ 			newpage = page;[m
+ 		}[m
+ [m
+[31m-		if (!is_zone_device_page(newpage))[m
+[31m-			lru_cache_add(newpage);[m
+ 		remove_migration_ptes(page, newpage, false);[m
+ 		unlock_page(page);[m
+ [m
+[31m-		put_page(page);[m
+[32m+[m		[32mif (is_zone_device_page(page))[m
+[32m+[m			[32mput_page(page);[m
+[32m+[m		[32melse[m
+[32m+[m			[32mputback_lru_page(page);[m
+ [m
+ 		if (newpage != page) {[m
+ 			unlock_page(newpage);[m
+[31m-			put_page(newpage);[m
+[32m+[m			[32mif (is_zone_device_page(newpage))[m
+[32m+[m				[32mput_page(newpage);[m
+[32m+[m			[32melse[m
+[32m+[m				[32mputback_lru_page(newpage);[m
+ 		}[m
+ 	}[m
+ }[m
+[1mdiff --git a/mm/page_ext.c b/mm/page_ext.c[m
+[1mindex 2a52fd9ed464..165998a4986d 100644[m
+[1m--- a/mm/page_ext.c[m
+[1m+++ b/mm/page_ext.c[m
+[36m@@ -148,6 +148,7 @@[m [mstruct page_ext *lookup_page_ext(const struct page *page)[m
+ 					MAX_ORDER_NR_PAGES);[m
+ 	return get_entry(base, index);[m
+ }[m
+[32m+[m[32mEXPORT_SYMBOL_GPL(lookup_page_ext);[m
+ [m
+ static int __init alloc_node_page_ext(int nid)[m
+ {[m
+[36m@@ -217,7 +218,7 @@[m [mstruct page_ext *lookup_page_ext(const struct page *page)[m
+ 		return NULL;[m
+ 	return get_entry(section->page_ext, pfn);[m
+ }[m
+[31m-[m
+[32m+[m[32mEXPORT_SYMBOL_GPL(lookup_page_ext);[m
+ static void *__meminit alloc_page_ext(size_t size, int nid)[m
+ {[m
+ 	gfp_t flags = GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN;[m

@@ -134,7 +134,7 @@ static void putback_movable_page(struct page *page)
  *
  * This function shall be used whenever the isolated pageset has been
  * built from lru, balloon, hugetlbfs page. See isolate_migratepages_range()
- * and isolate_hugetlb().
+ * and isolate_huge_page().
  */
 void putback_movable_pages(struct list_head *l)
 {
@@ -424,12 +424,8 @@ int migrate_page_move_mapping(struct address_space *mapping,
 	if (PageSwapBacked(page)) {
 		__SetPageSwapBacked(newpage);
 		if (PageSwapCache(page)) {
-			int i;
-
 			SetPageSwapCache(newpage);
-			for (i = 0; i < (1 << compound_order(page)); i++)
-				set_page_private(newpage + i,
-						 page_private(page + i));
+			set_page_private(newpage, page_private(page));
 		}
 	} else {
 		VM_BUG_ON_PAGE(PageSwapCache(page), page);
@@ -952,12 +948,9 @@ static int move_to_new_page(struct page *newpage, struct page *page,
 		if (!PageMappingFlags(page))
 			page->mapping = NULL;
 
-		if (likely(!is_zone_device_page(newpage))) {
-			int i, nr = compound_nr(newpage);
+		if (likely(!is_zone_device_page(newpage)))
+			flush_dcache_page(newpage);
 
-			for (i = 0; i < nr; i++)
-				flush_dcache_page(newpage + i);
-		}
 	}
 out:
 	return rc;
@@ -1291,7 +1284,6 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 	struct page *new_hpage;
 	struct anon_vma *anon_vma = NULL;
 	struct address_space *mapping = NULL;
-	enum ttu_flags ttu = 0;
 
 	/*
 	 * Migratability of hugepages depends on architectures and their size.
@@ -1345,6 +1337,9 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 		goto put_anon;
 
 	if (page_mapped(hpage)) {
+		bool mapping_locked = false;
+		enum ttu_flags ttu = 0;
+
 		if (!PageAnon(hpage)) {
 			/*
 			 * In shared mappings, try_to_unmap could potentially
@@ -1356,11 +1351,15 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 			if (unlikely(!mapping))
 				goto unlock_put_anon;
 
+			mapping_locked = true;
 			ttu |= TTU_RMAP_LOCKED;
 		}
 
 		try_to_migrate(hpage, ttu);
 		page_was_mapped = 1;
+
+		if (mapping_locked)
+			i_mmap_unlock_write(mapping);
 	}
 
 	if (!page_mapped(hpage))
@@ -1368,11 +1367,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 
 	if (page_was_mapped)
 		remove_migration_ptes(hpage,
-			rc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage,
-				ttu ? true : false);
-
-	if (ttu & TTU_RMAP_LOCKED)
-		i_mmap_unlock_write(mapping);
+			rc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage, false);
 
 unlock_put_anon:
 	unlock_page(new_hpage);
@@ -1650,6 +1645,142 @@ struct page *alloc_migration_target(struct page *page, unsigned long private)
 	return new_page;
 }
 
+/* =========================
+ * UTS bulk file-page migration helper
+ * ========================= */
+
+struct uts_bulk_migrate_page {
+	struct list_head lru;
+	struct page *page;
+	int index;
+};
+
+struct uts_bulk_migrate_target {
+	int target_nid;
+	struct page **dst_pages;
+	u8 *status;
+};
+
+static struct page *uts_alloc_migration_target(struct page *page,
+					       unsigned long private)
+{
+	struct uts_bulk_migrate_target *target;
+	struct uts_bulk_migrate_page *entry;
+	struct migration_target_control mtc;
+	struct page *newpage;
+
+	target = (struct uts_bulk_migrate_target *)private;
+	entry = container_of(page->lru.prev, struct uts_bulk_migrate_page, lru);
+
+	mtc.nid = target->target_nid;
+	mtc.nmask = NULL;
+	mtc.gfp_mask = GFP_HIGHUSER_MOVABLE | __GFP_THISNODE;
+
+	newpage = alloc_migration_target(page, (unsigned long)&mtc);
+	if (!newpage)
+		return NULL;
+
+	target->dst_pages[entry->index] = newpage;
+	target->status[entry->index] = 1;
+
+	return newpage;
+}
+
+/*
+ * UTS: migrate an array of file-backed base pages to target_nid.
+ *
+ * Return:
+ *   >= 0: number of pages that failed to migrate
+ *   < 0:  errno
+ *
+ * status[i]:
+ *   1 = migrated / destination page allocated
+ *   0 = failed or skipped
+ *
+ * dst_pages[i]:
+ *   destination page for successful migration, NULL otherwise
+ */
+int uts_migrate_file_pages_to_node_bulk(struct page **src_pages,
+					struct page **dst_pages,
+					u8 *status,
+					int nr_pages,
+					int target_nid)
+{
+	LIST_HEAD(migrate_list);
+	struct uts_bulk_migrate_page *entries;
+	struct uts_bulk_migrate_target target;
+	unsigned int nr_succeeded = 0;
+	int i, ret;
+
+	if (!src_pages || !dst_pages || !status || nr_pages <= 0)
+		return -EINVAL;
+
+	entries = kcalloc(nr_pages, sizeof(*entries), GFP_KERNEL);
+	if (!entries)
+		return -ENOMEM;
+
+	for (i = 0; i < nr_pages; i++) {
+		struct page *page = src_pages[i];
+
+		dst_pages[i] = NULL;
+		status[i] = 0;
+
+		if (!page)
+			continue;
+
+		/* UTS helper is intentionally for file-backed base pages. */
+		if (PageAnon(page))
+			continue;
+		if (PageHuge(page) || PageTransHuge(page) || PageCompound(page))
+			continue;
+		if (!page_mapping(page) || !page_mapping(page)->host)
+			continue;
+		if (page_to_nid(page) == target_nid)
+			continue;
+
+		if (isolate_lru_page(page))
+			continue;
+
+		entries[i].page = page;
+		entries[i].index = i;
+
+		/*
+		 * migrate_pages() expects page->lru to be linked directly.
+		 * Keep entry metadata in a parallel array; the page itself
+		 * is what goes onto migrate_list.
+		 */
+		list_add_tail(&page->lru, &migrate_list);
+
+		mod_node_page_state(page_pgdat(page),
+				    NR_ISOLATED_ANON + page_is_file_lru(page),
+				    thp_nr_pages(page));
+	}
+
+	if (list_empty(&migrate_list)) {
+		kfree(entries);
+		return 0;
+	}
+
+	target.target_nid = target_nid;
+	target.dst_pages = dst_pages;
+	target.status = status;
+
+	ret = migrate_pages(&migrate_list,
+			    uts_alloc_migration_target,
+			    NULL,
+			    (unsigned long)&target,
+			    MIGRATE_SYNC,
+			    MR_DEMOTION,
+			    &nr_succeeded);
+
+	if (ret)
+		putback_movable_pages(&migrate_list);
+
+	kfree(entries);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(uts_migrate_file_pages_to_node_bulk);
+
 #ifdef CONFIG_NUMA
 
 static int store_status(int __user *status, int start, int value, int nr)
@@ -1724,9 +1855,8 @@ static int add_page_for_migration(struct mm_struct *mm, unsigned long addr,
 
 	if (PageHuge(page)) {
 		if (PageHead(page)) {
-			err = isolate_hugetlb(page, pagelist);
-			if (!err)
-				err = 1;
+			isolate_huge_page(page, pagelist);
+			err = 1;
 		}
 	} else {
 		struct page *head;
@@ -1790,7 +1920,6 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 			 const int __user *nodes,
 			 int __user *status, int flags)
 {
-	compat_uptr_t __user *compat_pages = (void __user *)pages;
 	int current_node = NUMA_NO_NODE;
 	LIST_HEAD(pagelist);
 	int start, i;
@@ -1804,17 +1933,8 @@ static int do_pages_move(struct mm_struct *mm, nodemask_t task_nodes,
 		int node;
 
 		err = -EFAULT;
-		if (in_compat_syscall()) {
-			compat_uptr_t cp;
-
-			if (get_user(cp, compat_pages + i))
-				goto out_flush;
-
-			p = compat_ptr(cp);
-		} else {
-			if (get_user(p, pages + i))
-				goto out_flush;
-		}
+		if (get_user(p, pages + i))
+			goto out_flush;
 		if (get_user(node, nodes + i))
 			goto out_flush;
 		addr = (unsigned long)untagged_addr(p);
@@ -2435,13 +2555,12 @@ next:
 		migrate->dst[migrate->npages] = 0;
 		migrate->src[migrate->npages++] = mpfn;
 	}
+	arch_leave_lazy_mmu_mode();
+	pte_unmap_unlock(ptep - 1, ptl);
 
 	/* Only flush the TLB if we actually modified any entries */
 	if (unmapped)
 		flush_tlb_range(walk->vma, start, end);
-
-	arch_leave_lazy_mmu_mode();
-	pte_unmap_unlock(ptep - 1, ptl);
 
 	return 0;
 }
@@ -3063,16 +3182,20 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
 			newpage = page;
 		}
 
-		if (!is_zone_device_page(newpage))
-			lru_cache_add(newpage);
 		remove_migration_ptes(page, newpage, false);
 		unlock_page(page);
 
-		put_page(page);
+		if (is_zone_device_page(page))
+			put_page(page);
+		else
+			putback_lru_page(page);
 
 		if (newpage != page) {
 			unlock_page(newpage);
-			put_page(newpage);
+			if (is_zone_device_page(newpage))
+				put_page(newpage);
+			else
+				putback_lru_page(newpage);
 		}
 	}
 }
